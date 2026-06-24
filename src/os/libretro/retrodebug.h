@@ -215,9 +215,12 @@ typedef struct rd_FsStat {
 
 typedef struct rd_Filesystem {
     struct {
-        /* e.g. "iso", "bu0", "bu1", "cdda", "cdsys", "C".
+        /* A slug identifying the filesystem.
+         *
+         * e.g. "iso", "bu0", "bu1", "cdda", "cdsys", "C".
+         *
          * Use "fs" if nothing else suitable.
-           Should match regex ([a-zA-Z_][a-zA-Z0-9_]*)
+         * Should match regex [a-zA-Z_][a-zA-Z0-9_]*
          */
         char const *scheme;
         
@@ -949,6 +952,56 @@ typedef void (*rd_Set)(rd_DebuggerIf* const debugger_if);
 #define RD_ARM_CFG_NVIC       (1 << 15) /* M-profile exception model (NVIC + hw frame push) */
 #define RD_ARM_CFG_VFP        (1 << 16) /* VFP floating-point registers */
 #define RD_ARM_CFG_NEON       (1 << 17) /* NEON SIMD (requires VFP) */
+
+/* HuC6280 — the PC Engine / TurboGrafx-16 CPU.  A WDC 65C02 superset (all the
+ * 65C02 RMB/SMB/BBR/BBS/STZ/etc. instructions) plus PCE-specific opcodes:
+ * block transfers (TAI/TIA/TII/TDD/TIN), bank-register ops (TAM/TMA), the
+ * speed switch (CSL/CSH), TST, and the VDC port writes (ST0/ST1/ST2).
+ *
+ * The CPU sees a 16-bit logical address space (eight 8 KB pages); each page's
+ * physical bank is selected by one of the eight MPR (Memory Page Register)
+ * bank registers, yielding a 21-bit (2 MB) physical space.  The base register
+ * layout (A,X,Y,S,PC,P at indices 0-5) matches RD_CPU_6502; the MPR bank
+ * registers and the speed/IRQ-mask/timer state follow. */
+#define RD_CPU_HUC6280 RD_MAKE_CPU_TYPE(8, 1)
+
+#define RD_HUC6280_A    0
+#define RD_HUC6280_X    1
+#define RD_HUC6280_Y    2
+#define RD_HUC6280_S    3   /* Stack Pointer */
+#define RD_HUC6280_PC   4
+#define RD_HUC6280_P    5   /* Processor status */
+#define RD_HUC6280_MPR0 6   /* Bank register for logical $0000-$1FFF */
+#define RD_HUC6280_MPR1 7   /* ...                    $2000-$3FFF     */
+#define RD_HUC6280_MPR2 8   /* ...                    $4000-$5FFF     */
+#define RD_HUC6280_MPR3 9   /* ...                    $6000-$7FFF     */
+#define RD_HUC6280_MPR4 10  /* ...                    $8000-$9FFF     */
+#define RD_HUC6280_MPR5 11  /* ...                    $A000-$BFFF     */
+#define RD_HUC6280_MPR6 12  /* ...                    $C000-$DFFF     */
+#define RD_HUC6280_MPR7 13  /* ...                    $E000-$FFFF     */
+#define RD_HUC6280_SPD  14  /* Speed (0=1.79MHz, 1=7.16MHz) */
+#define RD_HUC6280_IRQM 15  /* IRQ mask */
+#define RD_HUC6280_TIMS 16  /* Timer status (enabled) */
+#define RD_HUC6280_TIMV 17  /* Timer value */
+#define RD_HUC6280_TIML 18  /* Timer reload */
+#define RD_HUC6280_TIMD 19  /* Timer divider */
+
+#define RD_HUC6280_NUM_REGISTERS 20
+
+/* HuC6280 interrupt kinds (vectors: IRQ1=$FFF8, IRQ2=$FFF6, TIMER=$FFFA) */
+#define RD_HUC6280_IRQ2  0
+#define RD_HUC6280_IRQ1  1
+#define RD_HUC6280_TIMER 2
+
+/* HuC6280 P (status) flag bits */
+#define RD_HUC6280_FLAG_N 0x80  /* Negative */
+#define RD_HUC6280_FLAG_V 0x40  /* Overflow */
+#define RD_HUC6280_FLAG_T 0x20  /* Memory operation (HuC6280-specific) */
+#define RD_HUC6280_FLAG_B 0x10  /* Break */
+#define RD_HUC6280_FLAG_D 0x08  /* Decimal */
+#define RD_HUC6280_FLAG_I 0x04  /* IRQ disable */
+#define RD_HUC6280_FLAG_Z 0x02  /* Zero */
+#define RD_HUC6280_FLAG_C 0x01  /* Carry */
 
 #endif /* RETRO_DEBUG__ */
 
