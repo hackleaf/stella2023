@@ -26,6 +26,7 @@
 #include "Serializer.hxx"
 #include "StateManager.hxx"
 #include "Switches.hxx"
+#include "M6502.hxx"   // retrodebug rd_halt_flag (arret-debugger)
 #include "TIA.hxx"
 #include "TIASurface.hxx"
 
@@ -163,6 +164,12 @@ void StellaLIBRETRO::updateVideo()
   while (1)
   {
     tia.updateScanline();
+
+    // retrodebug (arret-debugger): a breakpoint/step halted the CPU mid-frame.
+    // updateScanline() already returned early (execute() reported a debugger
+    // status); bail out of the frame loop so retro_run() returns.  Emulation
+    // resumes from the exact instruction on the next retro_run().
+    if(rd_halt_flag) break;
 
     if(tia.scanlines() == 0) break;
   }

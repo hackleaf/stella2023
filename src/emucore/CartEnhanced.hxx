@@ -100,6 +100,16 @@ class CartridgeEnhanced : public Cartridge
     uInt16 ramBankCount() const override;
 
     /**
+      Internal RAM accessors (used by the retrodebug/arret cartram region).
+      CartridgeEnhanced holds the cart's RAM in myRAM/myRamSize, so expose it
+      here for all enhanced carts (CommaVid CV, F8SC, F6SC, DPC, ...).
+    */
+    uInt32 internalRamSize() const override { return static_cast<uInt32>(myRamSize); }
+    uInt8 internalRamGetValue(uInt16 addr) const override {
+      return (myRAM && addr < myRamSize) ? myRAM[addr] : 0;
+    }
+
+    /**
       Query whether the current PC allows code execution.
 
       @return  true, if code execution is allowed

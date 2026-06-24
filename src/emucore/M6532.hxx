@@ -130,6 +130,9 @@ class M6532 : public Device
     */
     const uInt8* getRAM() const { return myRAM.data(); }
 
+    // Writable RAM accessor for the retrodebug (arret-debugger) wram region.
+    uInt8* getRAM() { return myRAM.data(); }
+
   #ifdef DEBUGGER_SUPPORT
     /**
       Query the access counters

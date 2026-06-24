@@ -38,6 +38,24 @@ class DispatchResult;
 #include "Device.hxx"
 #include "Serializable.hxx"
 
+/* ----------------------------------------------------------------------- */
+/* retrodebug (arret-debugger) execution hook                              */
+/*                                                                         */
+/* Global hook installed by the libretro glue.  M6502::_execute() calls it */
+/* once before each instruction fetch, with PC pointing at the instruction */
+/* about to run.  A true return means a subscriber asked to halt: the CPU  */
+/* stops immediately with a debugger-status DispatchResult so the caller's */
+/* run loop unwinds cleanly.  Because Stella keeps the TIA/RIOT in lockstep */
+/* with the CPU after every execute(), the machine state is fully          */
+/* consistent at the halt point and resumes seamlessly on the next         */
+/* retro_run() — no PPU-style "phase resume" is needed.                    */
+/*                                                                         */
+/* Null when no debugger subscriptions are active.  rd_halt_flag suppresses */
+/* re-entrant firing during the halt and is cleared by the glue at the     */
+/* start of each retro_run().                                              */
+extern bool (*rd_execution_hook)();
+extern bool rd_halt_flag;
+
 /**
   The 6502 is an 8-bit microprocessor that has a 64K addressing space.
   This class provides a high compatibility 6502 microprocessor emulator.
@@ -138,6 +156,22 @@ class M6502 : public Serializable
       @return true iff a fatal error has occured
     */
     bool fatalError() const { return myExecutionStatus & FatalErrorBit; }
+
+    /* --- retrodebug (arret-debugger) register access ---
+       Always compiled (independent of DEBUGGER_SUPPORT) so the libretro glue
+       can read/write the CPU registers for the retrodebug interface. */
+    uInt8  rdRegA()  const { return A;  }
+    uInt8  rdRegX()  const { return X;  }
+    uInt8  rdRegY()  const { return Y;  }
+    uInt8  rdRegSP() const { return SP; }
+    uInt16 rdRegPC() const { return PC; }
+    uInt8  rdRegPS() const { return PS(); }
+    void rdSetRegA(uInt8 v)   { A  = v; }
+    void rdSetRegX(uInt8 v)   { X  = v; }
+    void rdSetRegY(uInt8 v)   { Y  = v; }
+    void rdSetRegSP(uInt8 v)  { SP = v; }
+    void rdSetRegPC(uInt16 v) { PC = v; }
+    void rdSetRegPS(uInt8 v)  { PS(v); }
 
     /**
       Get the 16-bit value of the Program Counter register.

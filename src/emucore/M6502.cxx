@@ -45,6 +45,12 @@
 #include "exception/EmulationWarning.hxx"
 #include "exception/FatalEmulationError.hxx"
 
+// retrodebug (arret-debugger) execution hook globals.  Defined here so the
+// core links cleanly in every build; the libretro glue assigns rd_execution_hook
+// when debugger subscriptions are active.  See M6502.hxx for the contract.
+bool (*rd_execution_hook)() = nullptr;
+bool rd_halt_flag = false;
+
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 M6502::M6502(const Settings& settings)
   : mySettings{settings}
@@ -354,6 +360,19 @@ inline void M6502::_execute(uInt64 cycles, DispatchResult& result)
         if(!mySystem->cart().canExecute(PC))
           FatalEmulationError::raise("cannot run code from cart RAM");
     #endif
+
+        // retrodebug (arret-debugger): fire the execution hook before fetching
+        // the next opcode.  PC points at the instruction about to run.  A true
+        // return means a subscriber requested a halt — stop immediately with a
+        // debugger-status result so execute() returns false and the caller's
+        // run loop (e.g. TIA::updateScanline) unwinds cleanly.  State is left
+        // fully consistent and resumes from this exact PC on the next run.
+        if(rd_execution_hook && !rd_halt_flag && rd_execution_hook())
+        {
+          rd_halt_flag = true;
+          result.setDebugger(currentCycles, "retrodebug halt");
+          return;
+        }
 
         // Fetch instruction at the program counter
         IR = peek(PC++, DISASM_CODE);  // This address represents a code section

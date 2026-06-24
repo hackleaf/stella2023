@@ -1323,9 +1323,14 @@ shared_ptr<DelayQueueIterator> TIA::delayQueueIterator() const
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 TIA& TIA::updateScanline()
 {
-  // Update frame by one scanline at a time
+  // Update frame by one scanline at a time.
+  // retrodebug (arret-debugger): also stop the moment the CPU halts on a
+  // breakpoint/step.  execute() reports a debugger-status DispatchResult as
+  // "success" (it isn't a fatal stop), so without this guard the loop would
+  // keep running with the execution hook suppressed and overshoot the
+  // breakpoint.  rd_halt_flag is always false outside debugging.
   const uInt32 line = scanlines();
-  while (line == scanlines() && mySystem->m6502().execute(1));
+  while (line == scanlines() && !rd_halt_flag && mySystem->m6502().execute(1));
 
   return *this;
 }

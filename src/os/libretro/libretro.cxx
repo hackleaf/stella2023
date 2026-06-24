@@ -19,6 +19,15 @@
 #include "PaletteHandler.hxx"
 #include "Version.hxx"
 
+// retrodebug (arret-debugger) glue
+#include "Console.hxx"
+#include "System.hxx"
+#include "M6502.hxx"
+#include "M6532.hxx"
+#include "TIA.hxx"
+#include "Cart.hxx"
+#include "retrodebug.h"
+
 
 static StellaLIBRETRO stella;
 
@@ -627,16 +636,25 @@ static void update_variables(bool init = false)
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+/* retrodebug (arret-debugger) console lifecycle hooks (defined in the glue
+   section below). */
+static void rd_on_console_created();
+static void rd_on_console_destroyed();
+
 static bool reset_system()
 {
   // clean restart
   stella.destroy();
+  rd_on_console_destroyed();
 
   // apply pre-boot settings first
   update_variables(true);
 
   // start system
   if(!stella.create(log_cb ? true : false)) return false;
+
+  // retrodebug: console now exists — expose CPU/memory regions
+  rd_on_console_created();
 
   // get auto-detect controllers
   input_type[0] = stella.getLeftControllerType();
@@ -725,9 +743,562 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+/* ====================================================================== */
+/* retrodebug glue (arret-debugger)                                       */
+/*                                                                        */
+/* The Atari 2600's 6507 is a full MOS 6502 (decimal mode intact, unlike  */
+/* the NES 2A03) with only 13 address pins, so its 8KB space mirrors       */
+/* through the 16-bit bus.  We expose the whole 64KB CPU address space and */
+/* let Stella's System resolve mirroring/bankswitching.                    */
+/*                                                                        */
+/* Halting uses Stella's native clean-stop: the execution hook returns     */
+/* true, M6502::_execute() stops with a debugger-status DispatchResult,    */
+/* and the frame loop unwinds.  No fceumm-style "phase resume" is needed   */
+/* because Stella keeps the TIA/RIOT in lockstep with the CPU.             */
+/* ====================================================================== */
+
+static rd_DebuggerIf *debugger_if;
+static bool rd_game_loaded = false;
+
+/* --- live system/CPU access (valid only while a game is loaded) --- */
+
+static System *rd_sys() {
+  return rd_game_loaded ? &stella.osystem().console().system() : nullptr;
+}
+static M6502 *rd_m6502() {
+  return rd_game_loaded ? &stella.osystem().console().system().m6502() : nullptr;
+}
+static M6532 *rd_riot() {
+  return rd_game_loaded ? &stella.osystem().console().system().m6532() : nullptr;
+}
+static TIA *rd_tia() {
+  return rd_game_loaded ? &stella.osystem().console().system().tia() : nullptr;
+}
+static Cartridge *rd_cart() {
+  return rd_game_loaded ? &stella.osystem().console().system().cart() : nullptr;
+}
+
+/* --- register get / set --- */
+
+static uint64_t rd_get_register(rd_Cpu const *self, unsigned reg) {
+  (void)self;
+  M6502 *cpu = rd_m6502();
+  if(!cpu) return 0;
+  switch(reg) {
+  case RD_6502_A:  return cpu->rdRegA();
+  case RD_6502_X:  return cpu->rdRegX();
+  case RD_6502_Y:  return cpu->rdRegY();
+  case RD_6502_S:  return cpu->rdRegSP();
+  case RD_6502_PC: return cpu->rdRegPC();
+  case RD_6502_P:  return cpu->rdRegPS();
+  default:         return 0;
+  }
+}
+
+static int rd_set_register(rd_Cpu const *self, unsigned reg, uint64_t value) {
+  (void)self;
+  M6502 *cpu = rd_m6502();
+  if(!cpu) return 0;
+  switch(reg) {
+  case RD_6502_A:  cpu->rdSetRegA((uInt8)value);   return 1;
+  case RD_6502_X:  cpu->rdSetRegX((uInt8)value);   return 1;
+  case RD_6502_Y:  cpu->rdSetRegY((uInt8)value);   return 1;
+  case RD_6502_S:  cpu->rdSetRegSP((uInt8)value);  return 1;
+  case RD_6502_PC: cpu->rdSetRegPC((uInt16)value); return 1;
+  case RD_6502_P:  cpu->rdSetRegPS((uInt8)value);  return 1;
+  default:         return 0;
+  }
+}
+
+/* --- CPU address space (64KB, mirroring resolved by System) --- */
+
+static uint8_t rd_bus_read(System *sys, uint16_t addr, bool side_effects) {
+  /* RAM/ROM pages expose a direct pointer — read it straight out.  This is
+     genuinely side-effect-free and safe to call concurrently with the running
+     core thread (at worst a stale byte during a RAM write; no hang).
+     I/O pages (TIA/RIOT) have a null directPeekBase: reading them via
+     device->peek() has side effects (e.g. latching the RIOT timer) that would
+     disrupt the live emulation, so for a side-effect-free read we return 0 as
+     the retrodebug contract allows.  Note: lockDataBus() is a no-op here — it
+     only takes effect under DEBUGGER_SUPPORT, which the libretro build omits. */
+  const System::PageAccess& pa = sys->getPageAccess(addr);
+  if(pa.directPeekBase)
+    return pa.directPeekBase[addr & System::PAGE_MASK];
+  // RIOT zero-page RAM ($80-$FF and mirrors) is serviced by M6532::peek (no
+  // direct pointer) but is side-effect-free to read straight from the RAM
+  // array.  A9=0 selects RAM; A9=1 selects the RIOT I/O registers.
+  if(pa.device == &sys->m6532() && (addr & 0x0200) == 0)
+    return sys->m6532().getRAM()[addr & 0x007f];
+  // Everything else is read-sensitive I/O (TIA / RIOT registers): reading via
+  // device->peek() has side effects (e.g. latching the RIOT timer) that would
+  // disrupt the live core, so a side-effect-free read returns 0 (contract).
+  if(!side_effects)
+    return 0;
+  return sys->peek(addr, Device::NONE);
+}
+
+static void rd_bus_write(System *sys, uint16_t addr, uint8_t val) {
+  /* Prefer the direct poke pointer (RAM) to avoid triggering I/O side effects
+     on the live core; fall back to the device poke for everything else. */
+  const System::PageAccess& pa = sys->getPageAccess(addr);
+  if(pa.directPokeBase)
+    pa.directPokeBase[addr & System::PAGE_MASK] = val;
+  else
+    sys->poke(addr, val, Device::NONE);
+}
+
+static uint64_t rd_cpu_peek(rd_Memory const *self, uint64_t address, uint64_t size,
+                            uint8_t *outbuff, bool side_effects) {
+  (void)self;
+  System *sys = rd_sys();
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t addr = address + i;
+    if(!sys || addr > 0xFFFF) { outbuff[i] = 0; continue; }
+    outbuff[i] = rd_bus_read(sys, (uint16_t)addr, side_effects);
+  }
+  return size;
+}
+
+static uint64_t rd_cpu_poke(rd_Memory const *self, uint64_t address, uint64_t size,
+                            uint8_t const *buff) {
+  (void)self;
+  System *sys = rd_sys();
+  if(!sys) return 0;
+  uint64_t count = 0;
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t addr = address + i;
+    if(addr > 0xFFFF) continue;
+    rd_bus_write(sys, (uint16_t)addr, buff[i]);
+    count++;
+  }
+  return count;
+}
+
+static rd_Memory rd_cpu_mem = {
+  /* .v1 = */ {
+    /* .id          */ "cpu",
+    /* .description */ "CPU Address Space ($0000-$FFFF)",
+    /* .alignment   */ 1,
+    /* .size        */ 0x10000,
+    /* .break_points*/ nullptr,
+    /* .peek        */ rd_cpu_peek,
+    /* .poke        */ rd_cpu_poke,
+    /* rest zero-initialized */
+  }
+};
+
+static const rd_Cpu rd_cpu = {
+  /* .v1 = */ {
+    /* .id            */ "6507",
+    /* .description   */ "MOS 6507",
+    /* .type          */ RD_CPU_6502,
+    /* .config        */ 0,   /* full 6502: decimal mode intact */
+    /* .memory_region */ &rd_cpu_mem,
+    /* .break_points  */ nullptr,
+    /* .get_register  */ rd_get_register,
+    /* .set_register  */ rd_set_register,
+    /* rest zero */
+  }
+};
+
+static const rd_Cpu *rd_cpus[] = { &rd_cpu, nullptr };
+
+/* ---- wram: 128-byte RIOT zero-page RAM ($80-$FF) ---- */
+
+static uint64_t rd_wram_peek(rd_Memory const *self, uint64_t address, uint64_t size,
+                             uint8_t *outbuff, bool side_effects) {
+  (void)self; (void)side_effects;
+  M6532 *riot = rd_riot();
+  const uint8_t *ram = riot ? riot->getRAM() : nullptr;
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t a = address + i;
+    outbuff[i] = (ram && a < 128) ? ram[a] : 0;
+  }
+  return size;
+}
+
+static uint64_t rd_wram_poke(rd_Memory const *self, uint64_t address, uint64_t size,
+                             uint8_t const *buff) {
+  (void)self;
+  M6532 *riot = rd_riot();
+  uint8_t *ram = riot ? riot->getRAM() : nullptr;
+  if(!ram) return 0;
+  uint64_t count = 0;
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t a = address + i;
+    if(a >= 128) continue;
+    ram[a] = buff[i];
+    count++;
+  }
+  return count;
+}
+
+static rd_Memory rd_wram_mem = {
+  /* .v1 = */ {
+    /* .id          */ "wram",
+    /* .description */ "RIOT RAM (zero page $80-$FF)",
+    /* .alignment   */ 1,
+    /* .size        */ 128,
+    /* .break_points*/ nullptr,
+    /* .peek        */ rd_wram_peek,
+    /* .poke        */ rd_wram_poke,
+  }
+};
+
+/* ---- io: TIA write registers ($00-$3F), via side-effect-free shadow ---- */
+
+static uint64_t rd_io_peek(rd_Memory const *self, uint64_t address, uint64_t size,
+                           uint8_t *outbuff, bool side_effects) {
+  (void)self; (void)side_effects;
+  TIA *tia = rd_tia();
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t a = address + i;
+    /* registerValue() returns the last-written shadow value for regs 0-63
+       without touching live TIA state. */
+    outbuff[i] = (tia && a < 0x40) ? tia->registerValue((uint8_t)a) : 0;
+  }
+  return size;
+}
+
+static uint64_t rd_io_poke(rd_Memory const *self, uint64_t address, uint64_t size,
+                           uint8_t const *buff) {
+  (void)self;
+  System *sys = rd_sys();
+  if(!sys) return 0;
+  uint64_t count = 0;
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t a = address + i;
+    if(a >= 0x40) continue;
+    sys->poke((uint16_t)a, buff[i], Device::NONE);  /* write to the live TIA */
+    count++;
+  }
+  return count;
+}
+
+static rd_Memory rd_io_mem = {
+  /* .v1 = */ {
+    /* .id          */ "io",
+    /* .description */ "TIA registers ($00-$3F, write shadow)",
+    /* .alignment   */ 1,
+    /* .size        */ 0x40,
+    /* .break_points*/ nullptr,
+    /* .peek        */ rd_io_peek,
+    /* .poke        */ rd_io_poke,
+  }
+};
+
+/* ---- rom: cartridge ROM image (writable for patching) ---- */
+
+static uint64_t rd_rom_peek(rd_Memory const *self, uint64_t address, uint64_t size,
+                            uint8_t *outbuff, bool side_effects) {
+  (void)self; (void)side_effects;
+  Cartridge *cart = rd_cart();
+  size_t romsz = 0;
+  const uint8_t *img = cart ? cart->getImage(romsz).get() : nullptr;
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t a = address + i;
+    outbuff[i] = (img && a < romsz) ? img[a] : 0;
+  }
+  return size;
+}
+
+static uint64_t rd_rom_poke(rd_Memory const *self, uint64_t address, uint64_t size,
+                            uint8_t const *buff) {
+  (void)self;
+  Cartridge *cart = rd_cart();
+  size_t romsz = 0;
+  /* The bank pointers index into this image, so patching it affects execution. */
+  uint8_t *img = cart ? const_cast<uint8_t*>(cart->getImage(romsz).get()) : nullptr;
+  if(!img) return 0;
+  uint64_t count = 0;
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t a = address + i;
+    if(a >= romsz) continue;
+    img[a] = buff[i];
+    count++;
+  }
+  return count;
+}
+
+static rd_Memory rd_rom_mem = {
+  /* .v1 = */ {
+    /* .id          */ "rom",
+    /* .description */ "Cartridge ROM",
+    /* .alignment   */ 1,
+    /* .size        */ 0,   /* set at load from the cart image */
+    /* .break_points*/ nullptr,
+    /* .peek        */ rd_rom_peek,
+    /* .poke        */ rd_rom_poke,
+  }
+};
+
+/* ---- cartram: cartridge internal RAM (e.g. CommaVid CV's 1KB) ----
+   Read-only here (no generic cart-RAM setter); writes go through the cpu
+   region's direct-poke window. */
+
+static uint64_t rd_cartram_peek(rd_Memory const *self, uint64_t address, uint64_t size,
+                                uint8_t *outbuff, bool side_effects) {
+  (void)self; (void)side_effects;
+  Cartridge *cart = rd_cart();
+  const uint32_t sz = cart ? cart->internalRamSize() : 0;
+  for(uint64_t i = 0; i < size; i++) {
+    const uint64_t a = address + i;
+    outbuff[i] = (cart && a < sz) ? cart->internalRamGetValue((uint16_t)a) : 0;
+  }
+  return size;
+}
+
+static rd_Memory rd_cartram_mem = {
+  /* .v1 = */ {
+    /* .id          */ "cartram",
+    /* .description */ "Cartridge RAM",
+    /* .alignment   */ 1,
+    /* .size        */ 0,   /* set at load; region omitted if the cart has none */
+    /* .break_points*/ nullptr,
+    /* .peek        */ rd_cartram_peek,
+    /* .poke        */ nullptr,   /* read-only (patch via the cpu region) */
+  }
+};
+
+/* Region list, populated at load by rd_setup_regions().  Must be a valid,
+   null-terminated array — much of the frontend iterates it without first
+   null-checking the array pointer. */
+static rd_Memory const *rd_mem_regions[8] = { nullptr };
+static rd_Filesystem const *rd_filesystems[] = { nullptr };
+static rd_MiscBreakpoint const *rd_break_points[] = { nullptr };
+static char const *rd_schemata[] = { nullptr };
+
+static rd_System rd_system = {
+  /* .v1 = */ {
+    /* .id              */ "a2600",
+    /* .cpus            */ rd_cpus,
+    /* .memory_regions  */ rd_mem_regions,
+    /* .filesystems     */ rd_filesystems,
+    /* .break_points    */ rd_break_points,
+    /* .schemata        */ rd_schemata,
+    /* .get_content_info*/ nullptr,
+  }
+};
+
+/* Build the memory-region list from the loaded cart.  Called after the
+   console is (re)created, while the frontend has not yet cached topology. */
+static void rd_setup_regions() {
+  Cartridge &cart = stella.osystem().console().system().cart();
+
+  size_t romsz = 0;
+  cart.getImage(romsz);
+  rd_rom_mem.v1.size = romsz;
+  const uint32_t cramsz = cart.internalRamSize();
+  rd_cartram_mem.v1.size = cramsz;
+
+  unsigned n = 0;
+  rd_mem_regions[n++] = &rd_wram_mem;
+  rd_mem_regions[n++] = &rd_io_mem;
+  if(romsz)  rd_mem_regions[n++] = &rd_rom_mem;
+  if(cramsz) rd_mem_regions[n++] = &rd_cartram_mem;
+  rd_mem_regions[n] = nullptr;
+}
+
+/* --- subscription system (breakpoints + stepping) ---
+   The 6507 has no IRQ/NMI pins, so interrupt and memory-watch subscriptions
+   are not implemented here. */
+
+static bool rd_execution_hook_impl();
+
+#define RD_MAX_SUBS 16
+
+typedef struct {
+  bool active;
+  rd_Subscription sub;
+  rd_SubscriptionID id;
+  int call_depth;
+} rd_SubSlot;
+
+static rd_SubSlot rd_subs[RD_MAX_SUBS];
+static rd_SubscriptionID rd_next_id = 1;
+
+static bool rd_has_exec_sub = false;   /* any breakpoint or step sub active */
+static bool rd_has_step_sub = false;   /* any step sub active */
+static uint8_t rd_sub_bitset[8192];    /* 64K bits for point breakpoints */
+
+static uint16_t rd_prev_pc;
+static bool rd_prev_valid;
+
+static void rd_recompute_sub_state() {
+  rd_has_exec_sub = false;
+  rd_has_step_sub = false;
+  memset(rd_sub_bitset, 0, sizeof(rd_sub_bitset));
+
+  for(int i = 0; i < RD_MAX_SUBS; i++) {
+    rd_SubSlot *s = &rd_subs[i];
+    if(!s->active) continue;
+    switch(s->sub.type) {
+    case RD_EVENT_BREAKPOINT: {
+      rd_has_exec_sub = true;
+      const uint16_t addr = (uint16_t)s->sub.breakpoint.address;
+      rd_sub_bitset[addr >> 3] |= (1 << (addr & 7));
+      break;
+    }
+    case RD_EVENT_STEP:
+      rd_has_exec_sub = true;
+      rd_has_step_sub = true;
+      break;
+    default:
+      break;
+    }
+  }
+
+  if(rd_has_exec_sub) {
+    rd_execution_hook = rd_execution_hook_impl;
+  } else {
+    rd_execution_hook = nullptr;
+    rd_prev_valid = false;
+  }
+}
+
+/* Track JSR/RTS/RTI to maintain call depth for STEP_OVER / STEP_OUT. */
+static void rd_track_calls(uint16_t old_pc) {
+  if(!rd_has_step_sub) return;
+  System *sys = rd_sys();
+  if(!sys) return;
+  const uint8_t opcode = rd_bus_read(sys, old_pc, false);
+  int delta = 0;
+  if(opcode == 0x20)       delta = +1;  /* JSR */
+  else if(opcode == 0x60)  delta = -1;  /* RTS */
+  else if(opcode == 0x40)  delta = -1;  /* RTI */
+  if(delta)
+    for(int i = 0; i < RD_MAX_SUBS; i++)
+      if(rd_subs[i].active && rd_subs[i].sub.type == RD_EVENT_STEP)
+        rd_subs[i].call_depth += delta;
+}
+
+static bool rd_fire_execution(uint16_t pc) {
+  if(!rd_has_exec_sub || !debugger_if) return false;
+
+  const bool pc_in_bitset = (rd_sub_bitset[pc >> 3] & (1 << (pc & 7))) != 0;
+  if(!rd_has_step_sub && !pc_in_bitset) return false;
+
+  for(int i = 0; i < RD_MAX_SUBS; i++) {
+    rd_SubSlot *s = &rd_subs[i];
+    if(!s->active) continue;
+
+    if(s->sub.type == RD_EVENT_BREAKPOINT) {
+      if((uint16_t)s->sub.breakpoint.address != pc) continue;
+      rd_Event ev;
+      memset(&ev, 0, sizeof(ev));
+      ev.type = RD_EVENT_BREAKPOINT;
+      ev.can_halt = true;
+      ev.breakpoint.cpu = &rd_cpu;
+      ev.breakpoint.address = pc;
+      if(debugger_if->v1.handle_event(debugger_if->v1.user_data, s->id, &ev))
+        return true;
+    } else if(s->sub.type == RD_EVENT_STEP) {
+      bool fire = false;
+      switch(s->sub.step.mode) {
+      case RD_STEP_INTO:           fire = true; break;
+      case RD_STEP_INTO_SKIP_IRQ:  fire = true; break;  /* no IRQs on 2600 */
+      case RD_STEP_OVER:           if(s->call_depth <= 0) fire = true; break;
+      case RD_STEP_OUT:            if(s->call_depth <  0) fire = true; break;
+      }
+      if(fire) {
+        rd_Event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = RD_EVENT_STEP;
+        ev.can_halt = true;
+        ev.step.cpu = &rd_cpu;
+        ev.step.address = pc;
+        if(debugger_if->v1.handle_event(debugger_if->v1.user_data, s->id, &ev))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool rd_execution_hook_impl() {
+  /* Already halting — don't re-fire for the rest of this phase. */
+  if(rd_halt_flag) return false;
+
+  M6502 *cpu = rd_m6502();
+  if(!cpu) return false;
+  const uint16_t pc = cpu->rdRegPC();
+
+  if(rd_prev_valid) rd_track_calls(rd_prev_pc);
+  rd_prev_pc = pc;
+  rd_prev_valid = true;
+
+  return rd_fire_execution(pc);
+}
+
+static rd_SubscriptionID rd_subscribe(rd_Subscription const *sub) {
+  if(!sub) return -1;
+  if(sub->type != RD_EVENT_BREAKPOINT && sub->type != RD_EVENT_STEP)
+    return -1;  /* interrupt/memory watchpoints unsupported on 2600 */
+
+  for(int i = 0; i < RD_MAX_SUBS; i++) {
+    if(!rd_subs[i].active) {
+      rd_subs[i].active = true;
+      rd_subs[i].sub = *sub;
+      rd_subs[i].id = rd_next_id++;
+      rd_subs[i].call_depth = 0;
+      rd_recompute_sub_state();
+      return rd_subs[i].id;
+    }
+  }
+  return -1;
+}
+
+static void rd_unsubscribe(rd_SubscriptionID id) {
+  for(int i = 0; i < RD_MAX_SUBS; i++) {
+    if(rd_subs[i].active && rd_subs[i].id == id) {
+      rd_subs[i].active = false;
+      rd_recompute_sub_state();
+      return;
+    }
+  }
+}
+
+/* --- console lifecycle (called from reset_system) --- */
+
+static void rd_on_console_destroyed() {
+  rd_game_loaded = false;
+  rd_execution_hook = nullptr;
+  rd_prev_valid = false;
+}
+
+static void rd_on_console_created() {
+  rd_game_loaded = true;
+  rd_prev_valid = false;
+  rd_halt_flag = false;
+  rd_setup_regions();
+}
+
+extern "C" RETRO_API void rd_set_debugger(rd_DebuggerIf *const dbg_if) {
+  debugger_if = dbg_if;
+  if(debugger_if) {
+    debugger_if->core_api_version = RD_API_VERSION;
+    debugger_if->v1.system = &rd_system;
+    debugger_if->v1.subscribe = rd_subscribe;
+    debugger_if->v1.unsubscribe = rd_unsubscribe;
+  }
+}
+
+static retro_proc_address_t core_get_proc_address(const char *sym) {
+  if(strcmp(sym, "rd_set_debugger") == 0)
+    return (retro_proc_address_t)rd_set_debugger;
+  return nullptr;
+}
+
+/* ====================================================================== */
+
 void retro_set_environment(retro_environment_t cb)
 {
   environ_cb = cb;
+
+  {
+    struct retro_get_proc_address_interface proc_iface = { core_get_proc_address };
+    environ_cb(RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK, &proc_iface);
+  }
 
   static struct retro_variable variables[] = {
     // Adding more variables and rearranging them is safe.
@@ -845,6 +1416,7 @@ bool retro_load_game(const struct retro_game_info *info)
 
   stella.setROM(info->path, info->data, info->size);
 
+  /* reset_system() creates the console and wires up retrodebug regions. */
   return reset_system();
 }
 
@@ -863,6 +1435,10 @@ void retro_reset()
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 void retro_run()
 {
+  /* retrodebug: clear any halt from the previous breakpoint so this frame can
+     run.  The backend's skip map steps the CPU past the just-hit address. */
+  rd_halt_flag = false;
+
   bool updated = false;
 
   if(environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
@@ -897,6 +1473,8 @@ void retro_run()
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 void retro_unload_game()
 {
+  rd_game_loaded = false;
+  rd_execution_hook = nullptr;
   stella.destroy();
 }
 
