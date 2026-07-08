@@ -94,7 +94,7 @@ rd_MemoryMap;
                                           // reads for reasons other than caching (e.g. hardware
                                           // I/O arbitration, read-sensitive registers, bus muxing).
 
-struct rd_Memory {
+typedef struct rd_Memory {
     struct {
         /* Matches regex: ([a-z_][a-z0-9_]*)
          * e.g. "ram", "wram", "rom"
@@ -152,7 +152,193 @@ struct rd_Memory {
         int (*cache_probe)(struct rd_Memory const* self, uint64_t address);
     }
     v1;
-};
+} rd_Memory;
+
+/* At most one register should be flagged as the program counter.
+ * For almost all CPUs, this should be exactly one register.
+*/
+#define RD_CUSTOM_CPU_REGISTER_PROGRAM_COUNTER 1
+
+/* At most one register should be flagged as the stack pointer.
+   Where the stack pointer is up to convention, this
+   should be the conventional stack pointer.
+*/
+#define RD_CUSTOM_CPU_REGISTER_STACK_POINTER 2
+
+/* At most one register may be flagged as a "link register,"
+   typically containing the return address. (It's common for CPU archs not to have this.)
+*/
+#define RD_CUSTOM_CPU_REGISTER_LINK 4
+
+/* At most one register may be flagged as a "frame pointer,"
+   (It's common for CPU archs not to have this. Generally pure convention.)
+*/
+#define RD_CUSTOM_CPU_REGISTER_FRAME_POINTER 8
+
+/* Indicates register is a (hardware-enforced) immutable zero reg.
+*/
+#define RD_CUSTOM_CPU_REGISTER_ZERO 16
+
+/* Indicates register conveys the data bank.
+ * (Note that the architecture might have a separate banking system unrelated to the CPU's.)
+ */
+#define RD_CUSTOM_CPU_REGISTER_BANK_DATA 32
+
+/* Indicates register conveys the instruction bank.
+ * (Note that the architecture might have a separate banking system unrelated to the CPU's.)
+*/
+#define RD_CUSTOM_CPU_REGISTER_BANK_INSTRUCTION 64
+
+typedef struct rd_CustomCpuRegister {
+    struct {
+        /* Matches regex: ([a-z_][a-z0-9_]*)
+         * e.g. "a", "pc" etc.
+        */
+        char const* id;
+        
+        /* Number of bits in this register */
+        unsigned width;
+        
+        /* see RD_CUSTOM_CPU_REGISTER_* */
+        uint32_t flags;
+        
+        /*
+         * Optional. For registers which contain named bits, such as status
+         * registers, bit_names is a list of strings. NULL string
+         * pointers can be used to indicate there is no name for the bit.
+         * Do not use empty strings.
+         * 
+         * If this field is non-NULL, the number of strings in the list
+         * must equal the 'width' field above.
+        */
+        char const* const* bit_names;
+    } v1;
+} rd_CustomCpuRegister;
+
+/* Indicates jump target can be computed statically */
+#define RD_CUSTOM_CPU_INSTRUCTION_HAS_JUMP_TARGET 1
+
+/* Unconditional non-sequential flow that isn't a subroutine
+ * (JP, JR uncond, RET, RETI, etc.) */
+#define RD_CUSTOM_CPU_INSTRUCTION_BREAKS_FLOW 2
+
+/* Indicates cpu instruction jumps somewhere with the
+ * expectation of later jumping back synchronously.
+*/
+#define RD_CUSTOM_CPU_INSTRUCTION_CALL 4
+
+/* Indicates cpu instruction returns synchronously from
+ * a subroutine.
+*/
+#define RD_CUSTOM_CPU_INSTRUCTION_RETURN 8
+
+/* Indicates an invalid/illegal CPU instruction
+*/
+#define RD_CUSTOM_CPU_INSTRUCTION_INVALID 16
+        
+typedef struct rd_CustomCpuInstruction {
+    struct {
+        // Must be nonzero.
+        uint8_t length;
+        
+        /* length of disassembled text (not including NUL terminator) */
+        uint8_t text_len;
+        
+        /* see RD_CUSTOM_CPU_INSTRUCTION_* */
+        uint32_t flags;
+        
+        /* Computed jump/call destination */
+        uint64_t target;
+        
+        /* for pipelined CPUs. 0 = immediate. */
+        unsigned delay_slots;
+        
+        /* e.g. "LD BC,$1234"
+        * Must always be zero-terminated. */
+        char text[256];
+    } v1;
+} rd_CustomCpuInstruction;
+
+#define RD_CUSTOM_CPU_BIGENDIAN 1
+
+/*
+ * Can be used in situation where retrodebug.h doesn't have the given CPU type already.
+ * The downside of this is that the core must do more work to support debugging, such as
+ * adding a disassembler.
+*/
+typedef struct rd_CustomCpu {
+    struct {
+        /* Matches regex: ([a-z_][a-z0-9_]*)
+         * e.g. "m68k", etc.
+        */
+        char const* id;
+        
+        /* human-readable CPU type name, e.g. "Motorola 68000" etc. */
+        char const* description;
+        
+        /* see RD_CUSTOM_CPU_* */
+        uint32_t flags;
+        
+        /*
+            Address space mask.
+            Must be 1 less than a power of 2.
+        */
+        uint64_t address_mask;
+
+        /* NULL-terminated list of cpu registers,
+           or NULL if this CPU type has no registers somehow.
+           The order of this list aligns with the reg index 
+           as accessed in rd_Cpu.get_register().
+        */
+        rd_CustomCpuRegister const* const* cpu_registers;
+        
+        /* In bytes, e.g. 1, 2, 4, 8...
+           0 has the same meaning as 1.
+        */
+        uint8_t instruction_alignment;
+        
+        /* in bytes, e.g. 16. */
+        uint8_t max_instruction_size;
+        
+        /* Optional. NULL-terminated list of instruction modes (or NULL).
+         * An instruction mode is way in which cpu state affects how
+         * instructions are fetched/parsed. For example, ARM/THUMB modes, or
+         * SNES 6502 compatability mode.
+         * Each instruction mode ID must match the regex [a-z_][a-z0-9_]*
+         */
+        char const* const* instruction_mode_ids;
+        
+        /* Optional. Returns CPU's current instruction mode, or negative for error. */
+        int (*get_current_instruction_mode)(struct rd_Cpu const* cpu);
+        
+        /* Optional. Sets CPU's current instruction mode. Returns false on error.
+           Instruction mode should be non-negative, indicating the index
+           of one of the instruction modes listed in this struct.
+        */
+        bool (*set_current_instruction_mode)(struct rd_Cpu const* cpu, int instruction_mode);
+        
+        /*
+         * Returns false on failure. No side effects.
+         * Instruction mode is either negative (meaning N/A or default) or else is the index
+         * of one of the instruction modes listed in this struct.
+         *  
+         * If the buffer isn't long enough to hold an instruction, that's an error (false should be returned).
+         *
+         * If there is an instruction bank register, and the PC width is less than 64,
+         * then address here may be concatenated with the bank in the MSB by the frontend.
+         *
+         * Illegal/invalid instructions are not failures; there is a flag in instruction that indicates legality.
+        */
+        bool (*disassemble)(
+            struct rd_CustomCpu const* self,
+            uint64_t address, size_t nbytes, uint8_t const* bytes,
+            int instruction_mode,
+            struct rd_CustomCpuInstruction* o_instruction
+        );
+        
+        /* TODO (future work) -- stack unwinding */
+    } v1;
+} rd_CustomCpu;
 
 typedef struct rd_Cpu {
     struct {
@@ -161,14 +347,24 @@ typedef struct rd_Cpu {
          * e.g. "z80", "m68k", "cpu1", "cpu2", "co", etc.
         */
         char const* id;
+        /* human-readable name e.g. "Main CPU"*/
         char const* description;
+        
+        /* e.g. RD_CPU_6502; RD_CPU_CUSTOM, etc. */
         unsigned type;
 
         /* CPU-type-specific configuration.  Interpretation depends on the
          * CPU type.  For example, ARM uses the lower 8 bits for the
          * architecture version and upper bits for capability flags.
-         * Set to 0 if not applicable. */
-        uint32_t config;
+         * Set to 0 if not applicable.
+         *
+         * In the case of a custom CPU type, this should be a pointer to the cpu type.
+         */
+        union
+        {
+            uint32_t config;
+            rd_CustomCpu const* custom_cpu_def;
+        };
 
         /* Memory region that is CPU addressable */
         rd_Memory const* memory_region;
@@ -188,8 +384,7 @@ typedef struct rd_Cpu {
         bool (*pipeline_get_delay_pc)(struct rd_Cpu const* self, unsigned delay, uint64_t* out_pc);
     }
     v1;
-}
-rd_Cpu;
+} rd_Cpu;
 
 /* ---- Filesystem ---- */
 
@@ -708,6 +903,9 @@ typedef void (*rd_Set)(rd_DebuggerIf* const debugger_if);
 #define RD_MAKE_CPU_TYPE(id, version) ((id) << 16 | (version))
 #define RD_CPU_API_VERSION(type) ((type) & 0xffffU)
 
+/* uses the 'custom CPU' API */
+#define RD_CPU_CUSTOM 0
+
 /* Supported CPUs in API version 1 */
 #define RD_CPU_Z80 RD_MAKE_CPU_TYPE(0, 1)
 
@@ -900,12 +1098,10 @@ typedef void (*rd_Set)(rd_DebuggerIf* const debugger_if);
 
 #define RD_SH2_NUM_REGISTERS 23
 
-/* ARM (32-bit, ARMv4T through ARMv7) — covers ARM7TDMI (GBA, DS ARM7),
+/* ARM (32-bit, ARMv4T through ARMv7) -- covers ARM7TDMI (GBA, DS ARM7),
  * ARM946E-S (DS ARM9), ARM11 (3DS), etc.
  *
- * NOTE: AArch64 (ARMv8 64-bit) has a completely different register file
- * (X0-X30, SP, PSTATE) and instruction encoding.  It should be defined as
- * a separate RD_CPU_AARCH64 type, not reuse this one. */
+ * NOTE: AArch64 should not use this CPU type */
 #define RD_CPU_ARM RD_MAKE_CPU_TYPE(7, 1)
 
 #define RD_ARM_R0   0
@@ -953,16 +1149,7 @@ typedef void (*rd_Set)(rd_DebuggerIf* const debugger_if);
 #define RD_ARM_CFG_VFP        (1 << 16) /* VFP floating-point registers */
 #define RD_ARM_CFG_NEON       (1 << 17) /* NEON SIMD (requires VFP) */
 
-/* HuC6280 — the PC Engine / TurboGrafx-16 CPU.  A WDC 65C02 superset (all the
- * 65C02 RMB/SMB/BBR/BBS/STZ/etc. instructions) plus PCE-specific opcodes:
- * block transfers (TAI/TIA/TII/TDD/TIN), bank-register ops (TAM/TMA), the
- * speed switch (CSL/CSH), TST, and the VDC port writes (ST0/ST1/ST2).
- *
- * The CPU sees a 16-bit logical address space (eight 8 KB pages); each page's
- * physical bank is selected by one of the eight MPR (Memory Page Register)
- * bank registers, yielding a 21-bit (2 MB) physical space.  The base register
- * layout (A,X,Y,S,PC,P at indices 0-5) matches RD_CPU_6502; the MPR bank
- * registers and the speed/IRQ-mask/timer state follow. */
+/* HuC6280 -- PC Engine / TurboGrafx-16 CPU. */
 #define RD_CPU_HUC6280 RD_MAKE_CPU_TYPE(8, 1)
 
 #define RD_HUC6280_A    0
