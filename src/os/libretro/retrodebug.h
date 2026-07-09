@@ -453,7 +453,9 @@ typedef struct rd_Filesystem {
 
 typedef struct rd_System {
     struct {
-        /* Common system id, lower case -- e.g. "nes", "gb", "gbc", "megadrive". Allows the front-end to identify the system type, so if there are other cores that implement the same system, follow their lead. */
+        /* Common system id, matching [a-z_][0-9a-z_]* -- e.g. "nes", "gb", "gbc", "megadrive".
+         * Allows the front-end to identify the system type, so if there are other
+         * cores that implement the same system, follow their lead. */
         char const* id;
 
         /* CPUs available in the system. Null-terminated pointer array.
